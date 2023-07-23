@@ -55,6 +55,8 @@ enable_forwarding() {
     
     echo
     echo "IP forwarding and iptables rules have been configured."
+    echo "Add the route by -"
+    echo "cmd> route ADD <destination> MASK <mask> <gateway> METRIC <metric> IF <Interface>"
 
 }
 
