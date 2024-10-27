@@ -1,7 +1,20 @@
+'''
+This script analyzes executables to find specific instructions, like jmp esp (opcode FFE4), or SEH combinations in the code sections.
+
+To use: Run the script from the command line:
+- python GadgetFinder.py example.exe FFE4
+- python GadgetFinder.py example.exe -SEH
+
+Optional:
+Use --loading-address 0x400000 to specify a loading address.
+Add -SEH to search for SEH combinations instead of a specific code.
+The script displays ASLR, DEP, and SafeSEH statuses, along with virtual addresses where it finds the specified code.
+'''
+
 import struct
 import argparse
 
-# Constants for the offsets and sizes
+# Constants for offsets and sizes
 DOS_HEADER_OFFSET = 0x3C
 PE_HEADER_SIGNATURE = b'PE\x00\x00'
 SECTION_HEADER_SIZE = 40
@@ -108,9 +121,8 @@ def search_SEH_combinations(f, num_of_sections, section_headers_offset):
                 
                 for j in range(len(section_data) - comb_length + 1):
                     if section_data[j:j + comb_length] == comb_bytes:
-                        offset = raw_data_offset + j
                         va_offset = virtual_address + j
-                        results.append((offset, va_offset, comb_desc))
+                        results.append((va_offset, comb_desc))
     
     return results
 
@@ -131,9 +143,8 @@ def search_binary_code(f, num_of_sections, section_headers_offset, binary_code_b
             
             for j in range(len(section_data) - binary_code_length + 1):
                 if section_data[j:j + binary_code_length] == binary_code_bytes:
-                    offset = raw_data_offset + j
                     va_offset = virtual_address + j
-                    jmp_esp_offsets.append((offset, va_offset))
+                    jmp_esp_offsets.append(va_offset)
     
     return jmp_esp_offsets
 
@@ -141,11 +152,11 @@ def check_aslr(dll_characteristics):
     return dll_characteristics & 0x0040 != 0
 
 def check_dep(dll_characteristics):
-    return dll_characteristics & 0x0100 == 0
+    return dll_characteristics & 0x0100 != 0
 
 def check_safeseh(data_directory_offset, f):
-    f.seek(data_directory_offset)
-    return read_dword(f, data_directory_offset + 128) == 0
+    f.seek(data_directory_offset + 128)
+    return read_dword(f, data_directory_offset + 128) != 0
 
 def main():
     parser = argparse.ArgumentParser(description='Search for SEH combinations or binary code in an executable.')
@@ -166,36 +177,24 @@ def main():
         pe_header_offset, num_of_sections, optional_header_size, optional_header_offset, dll_characteristics_offset, data_directory_offset = parse_pe_header(f)
         section_headers_offset = optional_header_offset + optional_header_size
         
-        aslr_enabled = check_aslr(read_dword(f, dll_characteristics_offset))
-        dep_enabled = check_dep(read_dword(f, dll_characteristics_offset))
+        dll_characteristics = read_word(f, optional_header_offset + dll_characteristics_offset)
+        aslr_enabled = check_aslr(dll_characteristics)
+        dep_enabled = check_dep(dll_characteristics)
         safeseh_enabled = check_safeseh(data_directory_offset, f)
         
-        if aslr_enabled:
-            print("ASLR: Enabled")
-        else:
-            print("ASLR: Disabled")
-        
-        if dep_enabled:
-            print("DEP: Enabled")
-        else:
-            print("DEP: Disabled")
-        
-        if safeseh_enabled:
-            print("SafeSEH: Enabled")
-        else:
-            print("SafeSEH: Disabled")
+        print(f"ASLR: {'Enabled' if aslr_enabled else 'Disabled'}")
+        print(f"DEP: {'Enabled' if dep_enabled else 'Disabled'}")
+        print(f"SafeSEH: {'Enabled' if safeseh_enabled else 'Disabled'}")
         
         if binary_code_bytes:
             jmp_esp_offsets = search_binary_code(f, num_of_sections, section_headers_offset, binary_code_bytes)
-            for offset, va_offset in jmp_esp_offsets:
-                # print(f"Binary code found at offset: 0x{offset:08X}, virtual address: 0x{(va_offset + loading_address):08X}")
-                print(f"Binary code found at : 0x{(va_offset + loading_address):08X}")
+            for va_offset in jmp_esp_offsets:
+                print(f"Binary code found at virtual address: 0x{va_offset + loading_address:08X}")
         
         if args.SEH:
             SEH_results = search_SEH_combinations(f, num_of_sections, section_headers_offset)
-            for offset, va_offset, desc in SEH_results:
-                # print(f"{desc} found at offset: 0x{offset:08X}, virtual address: 0x{(va_offset + loading_address):08X}")
-                print(f"{desc} found at : 0x{(va_offset + loading_address):08X}")
+            for va_offset, desc in SEH_results:
+                print(f"{desc} found at virtual address: 0x{va_offset + loading_address:08X}")
 
 if __name__ == "__main__":
     main()
