@@ -1,28 +1,39 @@
-'''
-This script analyzes executables to find specific instructions, like jmp esp (opcode FFE4), or SEH combinations in the code sections.
+#!/usr/bin/env python3
+"""
+GadgetFinder: A tool to analyze PE executables for specific instructions or SEH combinations.
 
-To use: Run the script from the command line:
-- python GadgetFinder.py example.exe FFE4
-- python GadgetFinder.py example.exe -SEH
-
-Optional:
-Use --loading-address 0x400000 to specify a loading address.
-Add -SEH to search for SEH combinations instead of a specific code.
-The script displays ASLR, DEP, and SafeSEH statuses, along with virtual addresses where it finds the specified code.
-'''
+Usage:
+    python GadgetFinder.py example.exe FFE4
+    python GadgetFinder.py example.exe -SEH
+    python GadgetFinder.py example.exe FFE4 --loading-address 0x400000
+"""
 
 import struct
 import argparse
+from typing import List, Tuple, Dict, Optional
+from dataclasses import dataclass
 
-# Constants for offsets and sizes
+# PE Format Constants
 DOS_HEADER_OFFSET = 0x3C
-PE_HEADER_SIGNATURE = b'PE\x00\x00'
+PE_SIGNATURE = b'PE\x00\x00'
 SECTION_HEADER_SIZE = 40
-IMAGE_SCN_CNT_CODE = 0x00000020  # Section contains executable code
+IMAGE_SCN_CNT_CODE = 0x20  # Section contains executable code
 
-# SEH combinations
-SEH_COMBINATIONS = {
-    "58 58 C3": "pop eax; pop eax; ret",
+@dataclass
+class PEHeaderInfo:
+    """Stores parsed PE header information"""
+    offset: int
+    num_sections: int
+    opt_header_size: int
+    opt_header_offset: int
+    dll_char_offset: int
+    data_dir_offset: int
+
+class GadgetFinder:
+    """Main class for analyzing PE executables"""
+    
+    SEH_COMBINATIONS: Dict[str, str] = {
+            "58 58 C3": "pop eax; pop eax; ret",
     "58 5B C3": "pop eax; pop ebx; ret",
     "58 59 C3": "pop eax; pop ecx; ret",
     "58 5A C3": "pop eax; pop edx; ret",
@@ -71,130 +82,129 @@ SEH_COMBINATIONS = {
     "5D 5E C3": "pop ebp; pop esi; ret",
     "5D 5F C3": "pop ebp; pop edi; ret",
     "5D 5D C3": "pop ebp; pop ebp; ret",
-}
+    }
 
-def read_dword(f, offset):
-    f.seek(offset)
-    return struct.unpack('<I', f.read(4))[0]
+    def __init__(self, filename: str, loading_address: int = 0):
+        self.filename = filename
+        self.loading_address = loading_address
+        self.file_data = self._load_file()
 
-def read_word(f, offset):
-    f.seek(offset)
-    return struct.unpack('<H', f.read(2))[0]
+    def _load_file(self) -> bytes:
+        """Load the entire file into memory"""
+        try:
+            with open(self.filename, 'rb') as f:
+                return f.read()
+        except (IOError, OSError) as e:
+            raise ValueError(f"Failed to read file {self.filename}: {e}")
 
-def parse_pe_header(f):
-    pe_header_offset = read_dword(f, DOS_HEADER_OFFSET)
-    f.seek(pe_header_offset)
-    if f.read(4) != PE_HEADER_SIGNATURE:
-        raise ValueError("Not a valid PE file.")
-    num_of_sections = read_word(f, pe_header_offset + 6)
-    optional_header_size = read_word(f, pe_header_offset + 20)
-    optional_header_offset = pe_header_offset + 24
-    magic = read_word(f, optional_header_offset)
-    is_pe32_plus = (magic == 0x20B)
-    
-    if is_pe32_plus:
-        dll_characteristics_offset = 78
-        data_directory_offset = 112
-    else:
-        dll_characteristics_offset = 66
-        data_directory_offset = 96
+    def _read_dword(self, offset: int) -> int:
+        """Read a 4-byte unsigned integer from offset"""
+        return struct.unpack('<I', self.file_data[offset:offset+4])[0]
 
-    return pe_header_offset, num_of_sections, optional_header_size, optional_header_offset, dll_characteristics_offset, data_directory_offset
+    def _read_word(self, offset: int) -> int:
+        """Read a 2-byte unsigned integer from offset"""
+        return struct.unpack('<H', self.file_data[offset:offset+2])[0]
 
-def search_SEH_combinations(f, num_of_sections, section_headers_offset):
-    results = []
-    
-    for i in range(num_of_sections):
-        section_offset = section_headers_offset + (i * SECTION_HEADER_SIZE)
-        characteristics = read_dword(f, section_offset + 36)
+    def parse_pe_header(self) -> PEHeaderInfo:
+        """Parse the PE header and return relevant offsets"""
+        pe_offset = self._read_dword(DOS_HEADER_OFFSET)
+        if self.file_data[pe_offset:pe_offset+4] != PE_SIGNATURE:
+            raise ValueError("Not a valid PE file")
+
+        num_sections = self._read_word(pe_offset + 6)
+        opt_header_size = self._read_word(pe_offset + 20)
+        opt_header_offset = pe_offset + 24
+        magic = self._read_word(opt_header_offset)
         
-        if characteristics & IMAGE_SCN_CNT_CODE:
-            virtual_address = read_dword(f, section_offset + 12)
-            raw_data_offset = read_dword(f, section_offset + 20)
-            raw_data_size = read_dword(f, section_offset + 16)
-            f.seek(raw_data_offset)
-            section_data = f.read(raw_data_size)
-            
-            for comb_hex, comb_desc in SEH_COMBINATIONS.items():
-                comb_bytes = bytes.fromhex(comb_hex)
-                comb_length = len(comb_bytes)
-                
-                for j in range(len(section_data) - comb_length + 1):
-                    if section_data[j:j + comb_length] == comb_bytes:
-                        va_offset = virtual_address + j
-                        results.append((va_offset, comb_desc))
-    
-    return results
+        is_pe32_plus = (magic == 0x20B)
+        dll_char_offset = 78 if is_pe32_plus else 66
+        data_dir_offset = 112 if is_pe32_plus else 96
 
-def search_binary_code(f, num_of_sections, section_headers_offset, binary_code_bytes):
-    binary_code_length = len(binary_code_bytes)
-    jmp_esp_offsets = []
+        return PEHeaderInfo(pe_offset, num_sections, opt_header_size,
+                          opt_header_offset, dll_char_offset, data_dir_offset)
 
-    for i in range(num_of_sections):
-        section_offset = section_headers_offset + (i * SECTION_HEADER_SIZE)
-        characteristics = read_dword(f, section_offset + 36)
+    def get_security_features(self, header: PEHeaderInfo) -> Tuple[bool, bool, bool]:
+        """Check ASLR, DEP, and SafeSEH status"""
+        dll_chars = self._read_word(header.opt_header_offset + header.dll_char_offset)
+        aslr = bool(dll_chars & 0x0040)
+        dep = bool(dll_chars & 0x0100)
+        safeseh = self._read_dword(header.data_dir_offset + 128) != 0
+        return aslr, dep, safeseh
+
+    def search_gadgets(self, header: PEHeaderInfo, 
+                      binary_code: Optional[bytes] = None) -> List[Tuple[int, str]]:
+        """Search for specific binary code or SEH combinations"""
+        results = []
+        section_offset = header.opt_header_offset + header.opt_header_size
         
-        if characteristics & IMAGE_SCN_CNT_CODE:
-            virtual_address = read_dword(f, section_offset + 12)
-            raw_data_offset = read_dword(f, section_offset + 20)
-            raw_data_size = read_dword(f, section_offset + 16)
-            f.seek(raw_data_offset)
-            section_data = f.read(raw_data_size)
-            
-            for j in range(len(section_data) - binary_code_length + 1):
-                if section_data[j:j + binary_code_length] == binary_code_bytes:
-                    va_offset = virtual_address + j
-                    jmp_esp_offsets.append(va_offset)
-    
-    return jmp_esp_offsets
+        for i in range(header.num_sections):
+            offset = section_offset + (i * SECTION_HEADER_SIZE)
+            if self._read_dword(offset + 36) & IMAGE_SCN_CNT_CODE:
+                va = self._read_dword(offset + 12)
+                raw_offset = self._read_dword(offset + 20)
+                raw_size = self._read_dword(offset + 16)
+                section_data = self.file_data[raw_offset:raw_offset + raw_size]
 
-def check_aslr(dll_characteristics):
-    return dll_characteristics & 0x0040 != 0
+                if binary_code:
+                    results.extend(self._search_binary(section_data, va, binary_code))
+                else:
+                    results.extend(self._search_seh(section_data, va))
 
-def check_dep(dll_characteristics):
-    return dll_characteristics & 0x0100 != 0
+        return results
 
-def check_safeseh(data_directory_offset, f):
-    f.seek(data_directory_offset + 128)
-    return read_dword(f, data_directory_offset + 128) != 0
+    def _search_binary(self, data: bytes, va: int, code: bytes) -> List[Tuple[int, str]]:
+        """Search for specific binary code in section data"""
+        results = []
+        code_len = len(code)
+        for i in range(len(data) - code_len + 1):
+            if data[i:i + code_len] == code:
+                results.append((va + i + self.loading_address, f"Found at 0x{va + i:08x}"))
+        return results
+
+    def _search_seh(self, data: bytes, va: int) -> List[Tuple[int, str]]:
+        """Search for SEH combinations in section data"""
+        results = []
+        for hex_code, desc in self.SEH_COMBINATIONS.items():
+            code_bytes = bytes.fromhex(hex_code)
+            code_len = len(code_bytes)
+            for i in range(len(data) - code_len + 1):
+                if data[i:i + code_len] == code_bytes:
+                    results.append((va + i + self.loading_address, desc))
+        return results
 
 def main():
-    parser = argparse.ArgumentParser(description='Search for SEH combinations or binary code in an executable.')
+    """Main execution function"""
+    parser = argparse.ArgumentParser(description=__doc__,
+                                   formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('executable', help='Path to the executable file')
-    parser.add_argument('binary_code', nargs='?', default=None, help='Binary code to search for (in hex format, e.g., "FFE4" for JMP ESP)')
-    parser.add_argument('-SEH', action='store_true', help='Search for specific combinations of instructions (SEH)')
-    parser.add_argument('--loading-address', type=lambda x: int(x, 16), default=0x00000000, help='Loading address of the executable (optional, in hexadecimal)') 
+    parser.add_argument('binary_code', nargs='?', help='Binary code to search (hex, e.g., "FFE4")')
+    parser.add_argument('-SEH', action='store_true', help='Search for SEH combinations')
+    parser.add_argument('--loading-address', type=lambda x: int(x, 16), 
+                       default=0, help='Loading address (hex)')
     
     args = parser.parse_args()
-    
-    if not args.binary_code and not args.SEH:
-        parser.error('Either binary_code or -SEH must be specified.')
-    
-    binary_code_bytes = bytes.fromhex(args.binary_code) if args.binary_code else None
-    loading_address = args.loading_address
-    
-    with open(args.executable, 'rb') as f:
-        pe_header_offset, num_of_sections, optional_header_size, optional_header_offset, dll_characteristics_offset, data_directory_offset = parse_pe_header(f)
-        section_headers_offset = optional_header_offset + optional_header_size
+    if not (args.binary_code or args.SEH):
+        parser.error('Either binary_code or -SEH must be specified')
+
+    try:
+        finder = GadgetFinder(args.executable, args.loading_address)
+        header = finder.parse_pe_header()
+        aslr, dep, safeseh = finder.get_security_features(header)
         
-        dll_characteristics = read_word(f, optional_header_offset + dll_characteristics_offset)
-        aslr_enabled = check_aslr(dll_characteristics)
-        dep_enabled = check_dep(dll_characteristics)
-        safeseh_enabled = check_safeseh(data_directory_offset, f)
+        print(f"ASLR: {'Enabled' if aslr else 'Disabled'}")
+        print(f"DEP: {'Enabled' if dep else 'Disabled'}")
+        print(f"SafeSEH: {'Enabled' if safeseh else 'Disabled'}")
         
-        print(f"ASLR: {'Enabled' if aslr_enabled else 'Disabled'}")
-        print(f"DEP: {'Enabled' if dep_enabled else 'Disabled'}")
-        print(f"SafeSEH: {'Enabled' if safeseh_enabled else 'Disabled'}")
+        binary_code = bytes.fromhex(args.binary_code) if args.binary_code else None
+        results = finder.search_gadgets(header, binary_code)
         
-        if binary_code_bytes:
-            jmp_esp_offsets = search_binary_code(f, num_of_sections, section_headers_offset, binary_code_bytes)
-            for va_offset in jmp_esp_offsets:
-                print(f"Binary code found at virtual address: 0x{va_offset + loading_address:08X}")
-        
-        if args.SEH:
-            SEH_results = search_SEH_combinations(f, num_of_sections, section_headers_offset)
-            for va_offset, desc in SEH_results:
-                print(f"{desc} found at virtual address: 0x{va_offset + loading_address:08X}")
+        for address, desc in results:
+            print(f"{desc}: 0x{address:08x}")
+
+    except ValueError as e:
+        print(f"Error: {e}")
+    except Exception as e:
+        print(f"Unexpected error: {e}")
 
 if __name__ == "__main__":
     main()
